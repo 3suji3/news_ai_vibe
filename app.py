@@ -11,7 +11,14 @@ import re
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
-from playwright.sync_api import sync_playwright
+
+# Playwright는 선택적으로 로드 (Streamlit Cloud 호환성)
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    sync_playwright = None
 
 # 환경변수 로드
 load_dotenv()
@@ -401,6 +408,10 @@ def fetch_articles_with_playwright(keyword, max_results=5):
     Returns:
         list: 기사 정보 리스트
     """
+    # Playwright를 사용할 수 없으면 빈 리스트 반환
+    if not PLAYWRIGHT_AVAILABLE or sync_playwright is None:
+        return []
+    
     try:
         articles = []
         
@@ -450,7 +461,7 @@ def fetch_articles_with_playwright(keyword, max_results=5):
         return articles
         
     except Exception as e:
-        st.warning(f"Playwright 크롤링 중 오류: {str(e)}")
+        # Playwright 오류는 조용히 처리
         return []
 
 # 기사 요약 함수
@@ -645,7 +656,10 @@ with st.sidebar:
     st.write("✅ 기사 검색 (Google News RSS)")
     st.write("✅ AI 기사 요약")
     st.write("✅ 기사 저장 (SQLite)")
-    st.write("✅ Playwright 크롤링 (네이버 뉴스)")
+    if PLAYWRIGHT_AVAILABLE:
+        st.write("✅ Playwright 크롤링 (네이버 뉴스)")
+    else:
+        st.write("⚠️ Playwright 크롤링 (미설치 - RSS만 사용)")
     
     # 의도 판단 디버깅 정보
     if "intent_log" in st.session_state and len(st.session_state.intent_log) > 0:
@@ -728,9 +742,12 @@ with st.sidebar:
     
     # ==================== Playwright 크롤링 설정 ====================
     st.divider()
-    st.write("**🌐 Playwright 크롤링:**")
-    st.caption("RSS에서 기사를 찾지 못할 때 자동으로 웹사이트에서 크롤링")
-    st.write("📊 지원: 네이버 뉴스 (동적 검색)")
+    st.write("**🌐 기사 검색 소스:**")
+    st.caption("✅ Google News RSS (기본 - 빠름)")
+    if PLAYWRIGHT_AVAILABLE:
+        st.caption("✅ Playwright 크롤링 (옵션 - 네이버 뉴스)")
+    else:
+        st.caption("⚠️ Playwright 미설치 (Streamlit Cloud 호환성)")
     
     st.divider()
     if st.button("🗑️ 대화 내역만 초기화"):
