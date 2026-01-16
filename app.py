@@ -1,6 +1,7 @@
 import os
 import streamlit as st
 from openai import OpenAI
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 import feedparser
 from datetime import datetime
@@ -247,15 +248,55 @@ except Exception as e:
 # ==================== GMS 클라이언트 초기화 ====================
 @st.cache_resource
 def get_openai_client():
-    api_key = os.getenv("OPENAI_API_KEY")
+    # 1) API 키 가져오기 (Streamlit Secrets 우선 → 환경변수)
+    api_key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
     if not api_key:
-        st.error("❌ API Key를 찾을 수 없습니다. .env 파일을 확인하세요.")
-        st.stop()
+        api_key = os.getenv("OPENAI_API_KEY")
     
-    return OpenAI(
-        base_url='https://gms.ssafy.io/gmsapi/api.openai.com/v1',
-        api_key=api_key
-    )
+    if not api_key:
+        st.error("❌ API Key를 찾을 수 없습니다. Secrets 또는 .env 파일을 확인하세요.")
+        st.stop()
+
+    # 2) Base URL 구성 (Secrets/Env로 설정 가능, 기본은 OpenAI)
+    default_base = "https://api.openai.com/v1"
+    base_url = None
+    # Streamlit Secrets 우선
+    if hasattr(st, "secrets"):
+        base_url = st.secrets.get("OPENAI_BASE_URL", None)
+    # 환경변수
+    if not base_url:
+        base_url = os.getenv("OPENAI_BASE_URL", None)
+    # SSAFY GMS 사용 시 예: https://gms.ssafy.io/gmsapi/v1
+    # 기본값은 OpenAI 공식 엔드포인트
+    if not base_url:
+        base_url = default_base
+
+    # 3) URL 형식 보정
+    # http/https로 시작하지 않거나 공백/잘못된 값이면 기본으로 교체
+    try:
+        if not isinstance(base_url, str) or not base_url.strip().lower().startswith(("http://", "https://")):
+            base_url = default_base
+        base_url = base_url.strip()
+        # 흔한 오타: .../api.openai.com/v1 → 게이트웨이에서는 /v1 만 필요
+        # 사용자가 잘못 입력한 경우 자동 보정은 어렵지만, 실패 시 기본으로 폴백
+    except Exception:
+        base_url = default_base
+
+    # 4) 클라이언트 생성 + 폴백 로직
+    try:
+        return OpenAI(base_url=base_url, api_key=api_key)
+    except Exception as e:
+        # 게이트웨이 URL 문제 가능성이 높으므로 기본 OpenAI로 폴백 시도
+        if base_url != default_base:
+            try:
+                st.warning("⚠️ 커스텀 Base URL로 초기화 실패. 기본 OpenAI 엔드포인트로 재시도합니다.")
+                return OpenAI(base_url=default_base, api_key=api_key)
+            except Exception as e2:
+                st.error(f"❌ OpenAI 클라이언트 초기화 실패: {e2}")
+                st.stop()
+        else:
+            st.error(f"❌ OpenAI 클라이언트 초기화 실패: {e}")
+            st.stop()
 
 client = get_openai_client()
 
