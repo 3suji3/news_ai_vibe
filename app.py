@@ -13,6 +13,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
+# Notion 클라이언트 (선택적으로 로드)
+try:
+    from notion_client import Client
+    NOTION_AVAILABLE = True
+except ImportError:
+    NOTION_AVAILABLE = False
+    Client = None
+
 # Playwright는 선택적으로 로드 (Streamlit Cloud 호환성)
 try:
     from playwright.sync_api import sync_playwright
@@ -30,6 +38,38 @@ st.set_page_config(
     page_icon="🤖",
     layout="wide"
 )
+
+# ==================== NOTION 클라이언트 초기화 ====================
+@st.cache_resource
+def get_notion_client():
+    """Notion 클라이언트 초기화"""
+    if not NOTION_AVAILABLE:
+        return None
+    
+    # Notion API Key 가져오기 (Streamlit Secrets 우선)
+    notion_key = None
+    try:
+        if hasattr(st, "secrets"):
+            notion_key = st.secrets.get("NOTION_API_KEY", None)
+    except Exception:
+        # Secrets 파일이 없거나 오류가 발생한 경우 무시
+        pass
+    
+    # 환경변수에서 가져오기
+    if not notion_key:
+        notion_key = os.getenv("NOTION_API_KEY")
+    
+    if not notion_key:
+        return None  # API Key가 없으면 Notion 기능 비활성화
+    
+    try:
+        return Client(auth=notion_key)
+    except Exception as e:
+        st.warning(f"⚠️ Notion 클라이언트 초기화 실패: {str(e)}")
+        return None
+
+# Notion 클라이언트 전역 변수
+notion_client = get_notion_client() if NOTION_AVAILABLE else None
 
 # ==================== DATABASE 초기화 ====================
 DB_PATH = Path("articles.db")
@@ -86,6 +126,59 @@ def save_article(title, link, keyword, published, summary=""):
     except Exception as e:
         st.error(f"기사 저장 중 오류: {str(e)}")
         return False
+
+def save_article_to_notion(title, link, keyword, published, summary=""):
+    """기사를 Notion 데이터베이스에 저장"""
+    if not notion_client or not NOTION_AVAILABLE:
+        return False
+    
+    try:
+        # Notion Database ID 가져오기
+        notion_db_id = None
+        try:
+            if hasattr(st, "secrets"):
+                notion_db_id = st.secrets.get("NOTION_DATABASE_ID", None)
+        except Exception:
+            pass
+        
+        if not notion_db_id:
+            notion_db_id = os.getenv("NOTION_DATABASE_ID")
+        
+        if not notion_db_id:
+            return False  # Database ID가 없으면 저장 불가
+        
+        # 기사 정보를 Notion 페이지로 생성
+        notion_client.pages.create(
+            parent={"database_id": notion_db_id},
+            properties={
+                "제목": {"title": [{"text": {"content": title[:100]}}]},  # Notion 제한으로 100자 제한
+                "링크": {"url": link},
+                "키워드": {"select": {"name": keyword}},
+                "발행일": {"date": {"start": published if published and published != "날짜 정보 없음" else datetime.now().isoformat()}},
+                "요약": {"rich_text": [{"text": {"content": summary[:1000]}}]},  # 요약 1000자 제한
+            }
+        )
+        return True
+    except Exception as e:
+        # Notion 저장 오류는 조용히 처리 (SQLite는 정상 작동)
+        return False
+
+def get_notion_save_status():
+    """Notion 저장 활성화 여부 확인"""
+    if not NOTION_AVAILABLE or not notion_client:
+        return False
+    
+    notion_db_id = None
+    try:
+        if hasattr(st, "secrets"):
+            notion_db_id = st.secrets.get("NOTION_DATABASE_ID", None)
+    except Exception:
+        pass
+    
+    if not notion_db_id:
+        notion_db_id = os.getenv("NOTION_DATABASE_ID")
+    
+    return bool(notion_db_id)
 
 def get_saved_articles(keyword=None, limit=10):
     """저장된 기사 조회"""
@@ -196,6 +289,7 @@ def auto_collect_news():
             articles = fetch_google_news(keyword, max_results=3)
             if articles:
                 for article in articles:
+                    # SQLite에 저장
                     save_article(
                         title=article['title'],
                         link=article['link'],
@@ -203,6 +297,16 @@ def auto_collect_news():
                         published=article['published'],
                         summary=article.get('summary', '')
                     )
+                    
+                    # Notion에도 저장 (활성화된 경우)
+                    if get_notion_save_status():
+                        save_article_to_notion(
+                            title=article['title'],
+                            link=article['link'],
+                            keyword=keyword,
+                            published=article['published'],
+                            summary=article.get('summary', '')
+                        )
         
         # 수집 완료 로그
         with open("collection_log.txt", "a", encoding="utf-8") as f:
@@ -249,7 +353,14 @@ except Exception as e:
 @st.cache_resource
 def get_openai_client():
     # 1) API 키 가져오기 (Streamlit Secrets 우선 → 환경변수)
-    api_key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+    api_key = None
+    try:
+        if hasattr(st, "secrets"):
+            api_key = st.secrets.get("OPENAI_API_KEY", None)
+    except Exception:
+        # Secrets 파일이 없거나 오류가 발생한 경우 무시
+        pass
+    
     if not api_key:
         api_key = os.getenv("OPENAI_API_KEY")
     
@@ -257,13 +368,19 @@ def get_openai_client():
         st.error("❌ API Key를 찾을 수 없습니다. Secrets 또는 .env 파일을 확인하세요.")
         st.stop()
 
-    # 2) Base URL 구성 (Secrets/Env로 설정 가능, 기본은 OpenAI)
-    default_base = "https://api.openai.com/v1"
+    # 2) Base URL 구성 (GMS 기본값 사용, Secrets/Env로 커스텀 가능)
+    # GMS 엔드포인트: https://gms.ssafy.io/gmsapi/api.openai.com/v1
+    default_base = "https://gms.ssafy.io/gmsapi/api.openai.com/v1"
     base_url = None
-    # Streamlit Secrets 우선
-    if hasattr(st, "secrets"):
-        base_url = st.secrets.get("OPENAI_BASE_URL", None)
-    # 환경변수
+    
+    # Streamlit Secrets에서 가져오기
+    try:
+        if hasattr(st, "secrets"):
+            base_url = st.secrets.get("OPENAI_BASE_URL", None)
+    except Exception:
+        pass
+    
+    # 환경변수에서 가져오기
     if not base_url:
         base_url = os.getenv("OPENAI_BASE_URL", None)
     # SSAFY GMS 사용 시 예: https://gms.ssafy.io/gmsapi/v1
@@ -523,6 +640,7 @@ def summarize_articles(articles, user_query):
     # 기사를 데이터베이스에 저장
     keyword = extract_search_keyword(user_query)
     for article in articles:
+        # SQLite에 저장
         save_article(
             title=article['title'],
             link=article['link'],
@@ -530,6 +648,16 @@ def summarize_articles(articles, user_query):
             published=article['published'],
             summary=article.get('summary', '')
         )
+        
+        # Notion에도 저장 (활성화된 경우)
+        if get_notion_save_status():
+            save_article_to_notion(
+                title=article['title'],
+                link=article['link'],
+                keyword=keyword,
+                published=article['published'],
+                summary=article.get('summary', '')
+            )
     
     # 검색 히스토리 저장
     save_search_history(keyword, len(articles))
@@ -702,6 +830,13 @@ with st.sidebar:
     else:
         st.write("⚠️ Playwright 크롤링 (미설치 - RSS만 사용)")
     
+    if NOTION_AVAILABLE and get_notion_save_status():
+        st.write("✅ Notion 저장 (활성화)")
+    elif NOTION_AVAILABLE:
+        st.write("⚠️ Notion 저장 (설정 필요)")
+    else:
+        st.write("⚠️ Notion 저장 (미설치)")
+    
     # 의도 판단 디버깅 정보
     if "intent_log" in st.session_state and len(st.session_state.intent_log) > 0:
         st.divider()
@@ -789,6 +924,22 @@ with st.sidebar:
         st.caption("✅ Playwright 크롤링 (옵션 - 네이버 뉴스)")
     else:
         st.caption("⚠️ Playwright 미설치 (Streamlit Cloud 호환성)")
+    
+    # ==================== Notion 저장 설정 ====================
+    st.divider()
+    st.write("**📔 Notion 저장 설정:**")
+    
+    if NOTION_AVAILABLE and get_notion_save_status():
+        st.success("✅ Notion 저장 활성화됨")
+        st.caption("수집된 기사가 자동으로 Notion에 저장됩니다.")
+    elif NOTION_AVAILABLE:
+        st.warning("⚠️ Notion API Key 또는 Database ID가 설정되지 않음")
+        st.caption("**.env 파일 또는 Secrets에 다음을 추가하세요:**")
+        st.caption("`NOTION_API_KEY` - Notion Integration Token")
+        st.caption("`NOTION_DATABASE_ID` - Notion Database ID")
+    else:
+        st.warning("⚠️ notion-client 패키지가 설치되지 않음")
+        st.caption("설치 명령: `pip install notion-client`")
     
     st.divider()
     if st.button("🗑️ 대화 내역만 초기화"):
